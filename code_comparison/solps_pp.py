@@ -49,8 +49,37 @@ import ipywidgets as widgets
 # from solps_python_scripts.read_b2fgmtry import read_b2fgmtry
 
 
+class TransientParamError(ValueError):
+    """Raised when a parameter is only available from balance.nc (final snapshot)."""
+
+
+B2TIME_PARAM_SOURCES = {
+    "te": ("te2d", False),
+    "Te": ("te2d", True),
+    "ne": ("ne2d", False),
+    "Ne": ("ne2d", False),
+    "ti": ("ti2d", False),
+    "Td+": ("ti2d", True),
+    "po": ("po2d", False),
+    "na": ("na2d", False),
+    "fhe2d": ("fhe2d", False),
+    "fhi2d": ("fhi2d", False),
+    "fch2d": ("fch2d", False),
+    "fna2d": ("fna2d", False),
+}
+
+B2TALLIES_REGIONAL = {
+    "tereg": "tereg",
+    "Te_reg": "tereg",
+    "nereg": "nereg",
+    "Ne_reg": "nereg",
+    "tireg": "tireg",
+    "Td+_reg": "tireg",
+}
+
+
 class SOLPScase:
-    def __init__(self, path, path_b2fgmtry=None):
+    def __init__(self, path, path_b2fgmtry=None, transient="auto"):
         """
         Note that everything in the balance file is in the Y, X convention unlike the
         X, Y convention in the results. This is not intended and it reads as X, Y in MATLAB.
@@ -304,7 +333,7 @@ class SOLPScase:
         self.derive_neutral_momentum()  # Get V_perp, V_pol, V_par of neutrals from EIRENE
         # Sign convention is set by self.momentum_sign above; call
         # self.reverse_velocities() to flip it (ion + neutral together).
-        
+        self._init_transient(transient)
 
     def read_b2fgmtry(self, path=None, verbose=False, strict=True):
         """
@@ -859,8 +888,224 @@ class SOLPScase:
 
         return (selector, yid)
 
+    def _init_transient(self, mode="auto"):
+        """
+        Open b2time.nc / b2tallies.nc when present. Geometry stays on balance.nc.
+        Known limitations: no ua in b2time (Vd+, M balance-only at itime != -1);
+        fhe2d != fhe_cond; EIRENE *_bal terms are balance-only.
+        """
+        b2time_path = os.path.join(self.path, "b2time.nc")
+        b2tallies_path = os.path.join(self.path, "b2tallies.nc")
+
+        self._b2time = None
+        self._b2tallies = None
+        self.times = None
+        self.ntime = 1
+        self.time_params = []
+
+        if mode == "auto":
+            self.transient = os.path.isfile(b2time_path)
+        elif mode is True:
+            if not os.path.isfile(b2time_path):
+                raise FileNotFoundError(
+                    f"transient=True but b2time.nc not found in {self.path}"
+                )
+            self.transient = True
+        elif mode is False:
+            self.transient = False
+            return
+        else:
+            raise ValueError(f"transient must be 'auto', True, or False, got {mode!r}")
+
+        if not self.transient:
+            return
+
+        self._b2time = nc.Dataset(b2time_path)
+        timesa = np.asarray(self._b2time.variables["timesa"][:]).ravel()
+        self.times = timesa.astype(float)
+        self.ntime = int(self.times.size)
+
+        if os.path.isfile(b2tallies_path):
+            self._b2tallies = nc.Dataset(b2tallies_path)
+
+        self.time_params = [
+            name for name in self._b2time.variables.keys() if name != "timesa"
+        ]
+
+        for name in sorted(set(B2TIME_PARAM_SOURCES.keys()) | {"Pe", "Pd+"}):
+            if name not in self.params:
+                self.params.append(name)
+        if self._b2tallies is not None:
+            for name in sorted(self._b2tallies.variables.keys()):
+                if name not in self.params:
+                    self.params.append(name)
+        self.params.sort()
+
+    def _resolve_time_index(self, itime=None, time=None):
+        if itime is None and time is None:
+            return -1
+        if not getattr(self, "transient", False):
+            return -1
+        if itime is not None:
+            idx = int(itime)
+            if idx < 0:
+                idx = self.ntime + idx
+            return max(0, min(idx, self.ntime - 1))
+        return int(np.argmin(np.abs(self.times - float(time))))
+
+    def _is_balance_only_at_time(self, param):
+        if param.endswith("_bal"):
+            return True
+        if param in (
+            "Vd+",
+            "M",
+            "NVd+",
+            "fhe_cond",
+            "fhi_cond",
+            "fhe_32",
+            "fhi_32",
+            "fhe_thermj",
+            "fhe_total",
+            "fhi_total",
+            "fht",
+            "fhtx",
+            "fhty",
+            "Na",
+            "Nm",
+            "Nn",
+            "Ta",
+            "Tm",
+            "Pa",
+            "Pm",
+            "Pn",
+            "Tn",
+            "Td",
+            "fhx_total",
+            "fhy_total",
+        ):
+            return True
+        if any(
+            param.startswith(prefix)
+            for prefix in ("fhex", "fhey", "fhix", "fhiy", "fnax", "fnay", "fmo")
+        ) and "2d" not in param:
+            return True
+        return False
+
+    def _postprocess_field_array(self, param, arr):
+        arr = np.asarray(arr)
+        if (
+            param.startswith("fh")
+            and "x" not in param
+            and "y" not in param
+            and "2d" not in param
+        ):
+            if arr.ndim >= 3:
+                arr = arr[:, :, 0]
+        if len(arr.shape) > 2:
+            if arr.shape[2] == 1:
+                arr = arr[:, :, 0]
+            else:
+                arr = arr.sum(axis=2)
+        return arr
+
+    def _get_balance_field(self, param, species=0, direction=0):
+        if param in self.bal:
+            arr = np.asarray(self.bal[param])
+        elif param in self.g:
+            arr = np.asarray(self.g[param])
+        else:
+            raise KeyError(f"Parameter {param!r} not found")
+        return self._postprocess_field_array(param, arr)
+
+    def _read_b2time_2d(self, varname, itime, species=0, direction=0):
+        if self._b2time is None:
+            raise RuntimeError("b2time.nc is not open")
+        raw = np.asarray(self._b2time.variables[varname][int(itime)])
+        if varname == "fna2d":
+            raw = raw[int(species), int(direction)]
+        elif varname in ("fhe2d", "fhi2d", "fch2d") and raw.ndim >= 3:
+            raw = raw[int(direction)]
+        elif varname == "na2d" and raw.ndim >= 3:
+            raw = raw[int(species)]
+        return raw.transpose()
+
+    def get_field(self, param, itime=None, time=None, species=0, direction=0):
+        resolved = self._resolve_time_index(itime, time)
+
+        if resolved == -1 or not getattr(self, "transient", False):
+            if resolved != -1 and self._is_balance_only_at_time(param):
+                raise TransientParamError(
+                    f"Parameter {param!r} is only available from balance.nc "
+                    "(final snapshot)."
+                )
+            return self._get_balance_field(param, species=species, direction=direction)
+
+        if self._is_balance_only_at_time(param):
+            raise TransientParamError(
+                f"Parameter {param!r} is not available in b2time.nc at itime={resolved}."
+            )
+
+        if param == "Pe":
+            qe = constants("q_e")
+            ne = self.get_field("ne", itime=resolved, species=species, direction=direction)
+            Te = self.get_field("Te", itime=resolved, species=species, direction=direction)
+            return ne * Te * qe
+        if param == "Pd+":
+            qe = constants("q_e")
+            ne = self.get_field("ne", itime=resolved, species=species, direction=direction)
+            Td = self.get_field("Td+", itime=resolved, species=species, direction=direction)
+            return ne * Td * qe
+
+        if param not in B2TIME_PARAM_SOURCES:
+            raise KeyError(f"Parameter {param!r} not found for transient case")
+
+        src, divide_qe = B2TIME_PARAM_SOURCES[param]
+        arr = self._read_b2time_2d(src, resolved, species=species, direction=direction)
+        if divide_qe:
+            arr = arr / constants("q_e")
+        return arr
+
+    def get_time_series(self, param, poloidal, radial, species=0, direction=0):
+        if not getattr(self, "transient", False):
+            raise RuntimeError("get_time_series requires a transient case (b2time.nc)")
+        times = np.asarray(self.times, dtype=float)
+        values = []
+        for i in range(self.ntime):
+            field = self.get_field(
+                param, itime=i, species=species, direction=direction
+            )
+            values.append(float(field[int(poloidal), int(radial)]))
+        return times, np.asarray(values, dtype=float)
+
+    def get_regional_timeseries(self, param, vreg=None):
+        if self._b2tallies is None:
+            raise RuntimeError("b2tallies.nc is not available")
+        varname = B2TALLIES_REGIONAL.get(param, param)
+        if varname not in self._b2tallies.variables:
+            raise KeyError(f"Regional parameter {param!r} not found in b2tallies.nc")
+        var = self._b2tallies.variables[varname]
+        data = np.asarray(var[:])
+        times = np.asarray(self.times, dtype=float)
+        if vreg is not None and data.ndim >= 2:
+            data = data[:, int(vreg)]
+        elif data.ndim >= 2:
+            data = data[:, 0]
+        return times, np.asarray(data, dtype=float).ravel()
+
+    def get_regional(self, param, itime=None, time=None, vreg=None):
+        times, values = self.get_regional_timeseries(param, vreg=vreg)
+        idx = self._resolve_time_index(itime, time)
+        if idx == -1:
+            idx = self.ntime - 1
+        return float(values[int(idx)])
+
     def close(self):
-        self.bal.close()
+        if getattr(self, "_b2time", None) is not None:
+            self._b2time.close()
+            self._b2time = None
+        if getattr(self, "_b2tallies", None) is not None:
+            self._b2tallies.close()
+            self._b2tallies = None
 
     def plot_2d(
         self,
@@ -887,6 +1132,8 @@ class SOLPScase:
         dpi=150,
         xlim=(None, None),
         ylim=(None, None),
+        itime=None,
+        time=None,
     ):
         # print(data)
         # print(len(data))
@@ -899,7 +1146,7 @@ class SOLPScase:
         if type(data) is type(np.array([])):
             # print("Data is numpy array")
             if not data.size > 0:
-                data = self.bal[param]
+                data = self.get_field(param, itime=itime, time=time)
         # else:
         # print(f"Data is not numpy array, it's {type(data)}")
         # elif data == None:
@@ -1000,7 +1247,15 @@ class SOLPScase:
             ax.set_xlabel("R [m]")
             ax.set_ylabel("Z [m]")
         if grid_only is False:
-            ax.set_title(param)
+            title = param
+            resolved_itime = self._resolve_time_index(itime, time)
+            if (
+                getattr(self, "transient", False)
+                and resolved_itime >= 0
+                and self.times is not None
+            ):
+                title = f"{param} @ t={float(self.times[resolved_itime]):.4g} s"
+            ax.set_title(title)
 
         if separatrix is True:
             self.plot_separatrix(ax=ax, **separatrix_kwargs)
@@ -1132,6 +1387,8 @@ class SOLPScase:
         guards=False,
         keep_geometry=True,
         interpolate_midplane=True,
+        itime=None,
+        time=None,
     ):
         """
         Return a 1D radial profile at the inner/outer midplane or at a target.
@@ -1178,6 +1435,7 @@ class SOLPScase:
         """
 
         bal = self.bal
+        resolved_itime = self._resolve_time_index(itime, time)
 
         if poloidal_index is None and region is None:
             raise ValueError("Must specify either poloidal_index or region")
@@ -1239,7 +1497,12 @@ class SOLPScase:
                     elif param in self.g:
                         df_pol_slice[param] = self.g[param][pol_selector, ring_id]
                     else:
-                        print(f"Parameter {param} not found")
+                        try:
+                            df_pol_slice[param] = self.get_field(
+                                param, itime=resolved_itime
+                            )[pol_selector, ring_id]
+                        except Exception:
+                            print(f"Parameter {param} not found")
 
                 # Interpolate to Z=0
 
@@ -1258,7 +1521,12 @@ class SOLPScase:
                 elif param in self.g:
                     df[param] = self.g[param][selector]
                 else:
-                    print(f"Parameter {param} not found")
+                    try:
+                        df[param] = self.get_field(
+                            param, itime=resolved_itime
+                        )[selector]
+                    except Exception:
+                        print(f"Parameter {param} not found")
 
         # Interpolate between cells to get separatrix distance
         hy = df["hy"].values
@@ -1292,6 +1560,13 @@ class SOLPScase:
         if guards is False:
             df = df.iloc[1:-1]  # Trim guards but keep indices
 
+        if (
+            getattr(self, "transient", False)
+            and resolved_itime >= 0
+            and self.times is not None
+        ):
+            df["time"] = float(self.times[resolved_itime])
+
         return df
 
     def _interpolate_exact_sol_ring(
@@ -1302,6 +1577,8 @@ class SOLPScase:
         radial_start_region=None,
         extrapolate_radial=False,
         debug=False,
+        itime=None,
+        time=None,
     ):
         """
         Returns poloidal data radially interpolated to an exact separatrix distance.
@@ -1349,7 +1626,12 @@ class SOLPScase:
 
         # Get midplane radial profile to find fractional ring index for desired sepdist
         radial_slice = self.get_1d_radial_data(
-            ["fpsi"], region=radial_start_region, keep_geometry=True, guards=False
+            ["fpsi"],
+            region=radial_start_region,
+            keep_geometry=True,
+            guards=False,
+            itime=itime,
+            time=time,
         )
 
         radial_dist_min = radial_slice["dist"].min()
@@ -1390,14 +1672,10 @@ class SOLPScase:
         )  # deduplicate, preserve order
 
         # Build lookup: param -> 2D array
+        resolved_itime = self._resolve_time_index(itime, time)
         lookup = {}
         for param_name in all_param_names:
-            if param_name in self.bal:
-                arr = self.bal[param_name]
-            elif param_name in self.g:
-                arr = self.g[param_name]
-            else:
-                raise ValueError(f"Parameter {param_name} not found")
+            arr = self.get_field(param_name, itime=resolved_itime)
 
             if (
                 param_name.startswith("fh")
@@ -1421,7 +1699,10 @@ class SOLPScase:
             self.plot_2d("Te", ax=ax, grid_only=True)
         for _, pol_i in enumerate(pol_indices):
             radial = self.get_1d_radial_data(
-                params=all_param_names, poloidal_index=pol_i
+                params=all_param_names,
+                poloidal_index=pol_i,
+                itime=itime,
+                time=time,
             )
 
             # Plot radial slices
@@ -1505,6 +1786,8 @@ class SOLPScase:
         interpolate_radial=True,
         extrapolate_radial=False,
         debug=False,
+        itime=None,
+        time=None,
     ):
         """
         Returns field line data from the balance file
@@ -1588,6 +1871,8 @@ class SOLPScase:
                 radial_start_region=radial_start_region,
                 debug=False,
                 extrapolate_radial=extrapolate_radial,
+                itime=itime,
+                time=time,
             )
 
             hx = df["hx"].values
@@ -1605,7 +1890,9 @@ class SOLPScase:
 
         else:
             if sepdist != None:
-                radial_df = self.get_1d_radial_data([], region="omp")
+                radial_df = self.get_1d_radial_data(
+                    [], region="omp", itime=itime, time=time
+                )
                 sepind = radial_df[radial_df["sep"] == 1].index[0]
                 sepadd = (
                     radial_df.loc[(radial_df["dist"] - sepdist).abs().idxmin()].name
@@ -1622,20 +1909,23 @@ class SOLPScase:
             vol = self.g["vol"][selector]
 
             data = {}
+            resolved_itime = self._resolve_time_index(itime, time)
 
             for param in params:
-                # Look in bal or geometry
-                if param in self.bal:
-                    data[param] = self.bal[param]
-                elif param in self.g:
-                    data[param] = self.g[param]
+                if param in ("R", "Z", "hx", "Btot", "Bpol", "vol") or param in self.g:
+                    if param in self.bal:
+                        data[param] = self.bal[param]
+                    elif param in self.g:
+                        data[param] = self.g[param]
+                    else:
+                        raise ValueError(f"Parameter {param} not found")
                 else:
-                    raise ValueError(f"Parameter {param} not found")
+                    data[param] = self.get_field(param, itime=resolved_itime)
 
                 if param.startswith("fh") and "x" not in param and "y" not in param:
-                    data[param] = data[param][:, :, 0]  # Select poloidal
+                    if len(data[param].shape) > 2:
+                        data[param] = data[param][:, :, 0]  # Select poloidal
 
-                # Catch special variables with more dimensions
                 if len(data[param].shape) > 2:
                     raise ValueError(f"Paramerer {param} has more than 2 dimensions")
 
@@ -1718,6 +2008,14 @@ class SOLPScase:
             df = df.iloc[::-1]
 
         df = df.reset_index(drop=True)
+
+        resolved_itime = self._resolve_time_index(itime, time)
+        if (
+            getattr(self, "transient", False)
+            and resolved_itime >= 0
+            and self.times is not None
+        ):
+            df["time"] = float(self.times[resolved_itime])
 
         if debug:
             fig, ax = plt.subplots(dpi=150)
